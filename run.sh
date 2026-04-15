@@ -12,11 +12,5 @@ fi
 	
 input=$1
 
-if [ -f "venv/bin/python3" ]; then
-    PYTHON="venv/bin/python3"
-else
-    PYTHON="python3"
-fi
-
-# run the solver
-$PYTHON src/main.py $input
+set -e 
+julia --project=. src/main.jl $input
