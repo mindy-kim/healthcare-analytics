@@ -1,7 +1,7 @@
 import json
 from argparse import ArgumentParser
 from pathlib import Path
-from ipinstance import IPInstance
+from ipinstance_old_old import IPInstance
 from timer import Timer
 
 if __name__ == "__main__":
@@ -25,6 +25,7 @@ if __name__ == "__main__":
     output_dict = {"Instance": filename,
                    "Time": f"{timer.getTime():.2f}",
                    "Result": objective_value if objective_value else "--",
-                   "Solution": "OPT" if solution else "--"}
+                   "Solution": "OPT" if solution else "--",
+                   "SolVec": solution}
 
     print(json.dumps(output_dict))

@@ -16,8 +16,8 @@ from ortools.linear_solver import pywraplp
 class IPInstance:
     numTests: int
     numDiseases: int
-    costOfTest: np.ndarray   # [n]   float
-    A: np.ndarray            # [n,m] int
+    costOfTest: np.ndarray   # [n]   float cost of each test
+    A: np.ndarray            # [n,m] int   A[i,j] = 1 iff test i positive for disease j
 
     def __init__(self, filename: str) -> None:
         self.load_from_file(filename)
@@ -34,42 +34,43 @@ class IPInstance:
 
         IP Formulation
         --------------
-          Variables : x[i] in {0,1}   (1 = test i is selected)
-          Minimize  : sum cost[i] * x[i]
-          s.t.        sum_{i : A[i,j]!=A[i,k]} x[i] >= 1   for all pairs (j<k)
-
-        Key architecture decision — FRESH LP PER NODE
-        ----------------------------------------------
-        A persistent LP with GLOP dual-simplex warm-start sounds appealing but
-        profiling revealed it yields exactly 1.0x speedup.  Changing variable
-        bounds (fixing/unfixing) between nodes corrupts GLOP's dual basis, so
-        every solve restarts from scratch anyway — at the cost of the full
-        constraint matrix regardless of how many rows are currently active.
-
-        Building a fresh GLOP instance per node sidesteps this entirely.  The
-        per-node LP is small: constraint relaxation skips every pair already
-        covered by a fixed-to-1 test, so at depth 20 only ~40 constraints
-        remain.  Measured timings (100_100 instance):
-          depth 0 : ~250ms   depth 10 : ~30ms   depth 20 : ~5ms
-          depth 25 : ~2ms    depth 30 : ~1ms
-        Since best-first BnB explores an average depth of ~27, most LP solves
-        cost 1–5ms.  With ~1000 nodes this gives ~3–8s vs ~60s for the broken
-        persistent-LP approach.
+          Variables : x[i] ∈ {0,1}   (1 = test i is selected)
+          Minimize  : Σ cost[i] · x[i]
+          s.t.        Σ_{i : A[i,j]≠A[i,k]} x[i] ≥ 1   ∀ disease pairs (j<k)
 
         Optimizations
         -------------
-        1.  FRESH GLOP PER NODE — no basis corruption, constraint relaxation
-            naturally shrinks the LP with depth.
-        2.  CONSTRAINT RELAXATION — pairs covered by any fixed-to-1 test are
-            never added to the node's LP.
-        3.  NUMPY INFEASIBILITY FILTER — vectorised check before building the LP.
-        4.  PREPROCESSING (forced selections) — single-option pairs fixed before BnB.
-        5.  DOMINATION PRUNING — cheaply-dominated tests eliminated before BnB.
-        6.  GREEDY RESTARTS — 15 randomised greedy runs for a tight initial UB.
-        7.  COST-WEIGHTED BRANCHING — branch on highest (frac*coverage/cost).
-        8.  REDUCED-COST FIXING — variables with rc > gap fixed to 0 per subtree.
-        9.  HYBRID NODE SELECTION — depth tiebreaker on equal-bound heap entries.
-        10. MIN-HEAP (best-first) — globally best-first, depth-first on ties.
+        1. PERSISTENT GLOP MODEL — one pywraplp model built once, reused for
+           every LP solve with warm-start from prior dual-simplex basis.
+
+        2. CONSTRAINT RELAXATION — when a test is fixed to 1, satisfied pair
+           constraints have their lower bound relaxed to 0.
+
+        3. PREPROCESSING (forced selections) — single-option pairs force their
+           test to 1 before BnB starts.
+
+        4. DOMINATION PRUNING — if test i covers a superset of what test j covers
+           at equal-or-lower cost, j can never appear in an optimal solution and
+           is permanently eliminated before BnB.
+
+        5. NUMPY VECTORISATION — pairwise column comparisons and greedy scoring.
+
+        6. GREEDY RESTARTS — multiple randomised greedy runs for a tighter initial
+           upper bound, pruning more of the tree from the very first node.
+
+        7. COST-WEIGHTED BRANCHING — branch on the fractional variable that covers
+           the most uncovered active pairs per unit cost, not just the most
+           fractional variable.
+
+        8. REDUCED-COST FIXING — after each LP solve, variables whose reduced cost
+           exceeds the remaining gap are fixed to 0 without branching.
+
+        9. HYBRID NODE SELECTION — depth is used as a tiebreaker so equal-bound
+           nodes are explored depth-first (finds incumbents faster, tightens bound
+           sooner) while the heap still globally favours the best lower bound.
+
+        10. MIN-HEAP (best-first search) — O(log n) node selection via heapq with
+            tie-breaking counter so Python never compares lists.
         """
         n     = self.numTests
         m     = self.numDiseases
@@ -88,112 +89,106 @@ class IPInstance:
         forced, covered_pairs = self._preprocess(disc_pairs, test_covers, num_pairs)
 
         # ── 3. Domination pruning ─────────────────────────────────────────────
+        # Must be computed on the FULL test_covers so dominated tests are found
+        # correctly before the active-pair subset is computed.
         dominated = self._domination_pruning(test_covers, costs, n, forced)
 
-        # Active pairs: remove pairs covered by forced tests; strip dominated
-        # tests from each remaining pair's discrimination set.
+        # Active pairs: not already covered by forced tests
+        active_pairs = [disc_pairs[p] for p in range(num_pairs) if p not in covered_pairs]
+
+        # Remove dominated tests from active pairs — they cannot appear in BnB.
+        # If a pair becomes empty after removal the problem is infeasible (should
+        # not happen if domination is computed correctly, but guard anyway).
         active_pairs = [
-            [i for i in disc_pairs[p] if i not in dominated]
-            for p in range(num_pairs)
-            if p not in covered_pairs
+            [i for i in disc if i not in dominated]
+            for disc in active_pairs
         ]
         if any(len(disc) == 0 for disc in active_pairs):
             self.solution        = None
             self.objective_value = None
             return None, None
 
-        # Numpy arrays for each disc set — used for vectorised coverage checks.
-        active_discs_np = [np.array(disc, dtype=np.intp) for disc in active_pairs]
-        num_active      = len(active_pairs)
-
-        # Inverse map: active_covers[i] = list of active pair indices test i covers.
+        # Inverse map: for each test, which active pairs does it cover?
         active_covers = [[] for _ in range(n)]
         for p, disc in enumerate(active_pairs):
             for i in disc:
                 active_covers[i].append(p)
+        num_active = len(active_pairs)
 
         # ── 4. Greedy upper bound (multiple restarts) ─────────────────────────
         best_sol, best_obj = self._greedy_upper_bound(
             costs, disc_pairs, test_covers, n, num_restarts=15
         )
 
-        # ── 5. Pre-build coefficient lists for fast LP construction ───────────
-        # disc_coeff[p] = list of (test_index, 1.0) for active pair p.
-        # Building this once avoids repeated list comprehensions inside solve_node.
-        disc_coeff = [[(i, 1.0) for i in disc] for disc in active_pairs]
+        # ── 5. Build ONE persistent GLOP model ────────────────────────────────
+        lp = pywraplp.Solver.CreateSolver("GLOP")
+        lp.SuppressOutput()
 
-        # ── 6. solve_node: build + solve a fresh LP for one BnB node ──────────
-        def solve_node(fixings):
-            """
-            Build a fresh GLOP LP for the node described by `fixings` and solve it.
+        x = [lp.NumVar(0.0, 1.0, f"x{i}") for i in range(n)]
 
-            `fixings` is a flat list of (test_index, 0_or_1) pairs accumulated
-            from root to this node (BnB decisions + reduced-cost fixings from
-            ancestor nodes).
+        # Fix forced tests to 1 and dominated tests to 0 permanently
+        for i in forced:
+            x[i].SetBounds(1.0, 1.0)
+        for i in dominated:
+            x[i].SetBounds(0.0, 0.0)
 
-            Steps
-            -----
-            a) Decode fixings into fixed_one / fixed_zero bool arrays.
-            b) Vectorised infeasibility check: any pair where all tests are in
-               fixed_zero and none are in fixed_one?
-            c) Build LP: add a constraint for every active pair NOT covered by
-               a fixed_one test.  Skip infeasible pairs already detected above.
-            d) Solve and return (lp_val, sol_list, rc_list).
-            """
-            # ── a) Decode fixings ─────────────────────────────────────────────
-            fixed_one  = np.zeros(n, dtype=bool)
-            fixed_zero = np.zeros(n, dtype=bool)
-            for i in forced:    fixed_one[i]  = True
-            for i in dominated: fixed_zero[i] = True
-            for idx, val in fixings:
-                if val == 1: fixed_one[idx]  = True
-                else:        fixed_zero[idx] = True
+        lp_obj = lp.Objective()
+        for i in range(n):
+            lp_obj.SetCoefficient(x[i], float(costs[i]))
+        lp_obj.SetMinimization()
 
-            # ── b) Vectorised infeasibility + coverage check ──────────────────
-            covered  = np.zeros(num_active, dtype=bool)  # pair covered by fixed_one
-            feasible = True
-            for p, disc_np in enumerate(active_discs_np):
-                if fixed_one[disc_np].any():
-                    covered[p] = True
-                elif fixed_zero[disc_np].all():
-                    feasible = False
-                    break
-            if not feasible:
-                return math.inf, None, None
+        ctrs = []
+        for disc in active_pairs:
+            ct = lp.Constraint(1.0, lp.infinity())
+            for i in disc:
+                ct.SetCoefficient(x[i], 1.0)
+            ctrs.append(ct)
 
-            # ── c) Build fresh LP ─────────────────────────────────────────────
-            lp = pywraplp.Solver.CreateSolver("GLOP")
-            lp.SuppressOutput()
+        # satisfied_by[p] = how many currently-fixed-to-1 tests cover active pair p.
+        satisfied_by = [0] * num_active
 
-            x = [lp.NumVar(0.0, 1.0, f"x{i}") for i in range(n)]
-            for i in range(n):
-                if fixed_one[i]:  x[i].SetBounds(1.0, 1.0)
-                elif fixed_zero[i]: x[i].SetBounds(0.0, 0.0)
+        for i in forced:
+            for p in active_covers[i]:
+                if satisfied_by[p] == 0:
+                    ctrs[p].SetBounds(0.0, lp.infinity())
+                satisfied_by[p] += 1
 
-            lp_obj = lp.Objective()
-            for i in range(n):
-                lp_obj.SetCoefficient(x[i], float(costs[i]))
-            lp_obj.SetMinimization()
+        prev_fixings = []
 
-            # Only add constraints for pairs NOT already covered.
-            for p in range(num_active):
-                if covered[p]:
-                    continue
-                ct = lp.Constraint(1.0, lp.infinity())
-                for i, c in disc_coeff[p]:
-                    ct.SetCoefficient(x[i], c)
+        def apply_and_solve(new_fixings):
+            nonlocal prev_fixings
 
-            # ── d) Solve ──────────────────────────────────────────────────────
+            # Reset previous node's bounds
+            for idx, val in prev_fixings:
+                x[idx].SetBounds(0.0, 1.0)
+                if val == 1:
+                    for p in active_covers[idx]:
+                        satisfied_by[p] -= 1
+                        if satisfied_by[p] == 0:
+                            ctrs[p].SetBounds(1.0, lp.infinity())
+
+            # Apply new node's bounds
+            for idx, val in new_fixings:
+                fv = float(val)
+                x[idx].SetBounds(fv, fv)
+                if val == 1:
+                    for p in active_covers[idx]:
+                        if satisfied_by[p] == 0:
+                            ctrs[p].SetBounds(0.0, lp.infinity())
+                        satisfied_by[p] += 1
+
+            prev_fixings = new_fixings
+
             status = lp.Solve()
-            if status != pywraplp.Solver.OPTIMAL:
-                return math.inf, None, None
+            if status == pywraplp.Solver.OPTIMAL:
+                lp_val = lp.Objective().Value()
+                sol    = [x[i].solution_value() for i in range(n)]
+                rc     = [x[i].reduced_cost()   for i in range(n)]
+                return lp_val, sol, rc
+            return math.inf, None, None
 
-            sol = [x[i].solution_value() for i in range(n)]
-            rc  = [x[i].reduced_cost()   for i in range(n)]
-            return lp.Objective().Value(), sol, rc
-
-        # ── 7. Root LP ────────────────────────────────────────────────────────
-        root_obj_val, root_sol, root_rc = solve_node([])
+        # ── 6. Root LP ────────────────────────────────────────────────────────
+        root_obj_val, root_sol, root_rc = apply_and_solve([])
 
         if root_sol is None:
             self.solution        = None
@@ -205,12 +200,14 @@ class IPInstance:
             self.objective_value = best_obj
             return best_sol, best_obj
 
-        # ── 8. Branch-and-Bound loop ──────────────────────────────────────────
-        free    = set(range(n)) - forced - dominated
+        # ── 7. Branch-and-Bound loop ──────────────────────────────────────────
         EPS     = 1e-6
         counter = 0
         # Heap entry: (lp_bound, counter, neg_depth, fixings, lp_sol, lp_rc)
-        heap = [(root_obj_val, counter, 0, [], root_sol, root_rc)]
+        # neg_depth as tiebreaker → deeper nodes explored first when bounds tie
+        # (depth-first dive finds incumbents faster, tightens bound sooner)
+        heap  = [(root_obj_val, counter, 0, [], root_sol, root_rc)]
+        free  = set(range(n)) - forced - dominated
 
         while heap:
             lp_bound, _, neg_depth, fixings, lp_sol, lp_rc = heapq.heappop(heap)
@@ -219,47 +216,46 @@ class IPInstance:
             if lp_bound >= best_obj - EPS:
                 continue
 
-            # Reduced-cost fixing for this subtree.
-            gap      = best_obj - lp_bound
-            fixed_in_node = {fv[0] for fv in fixings}
+            # ── Reduced-cost fixing ───────────────────────────────────────────
+            # Variables whose reduced cost alone exceeds the remaining gap can be
+            # fixed to 0 at this node without branching — they can never improve
+            # the objective enough to justify being selected.
+            gap = best_obj - lp_bound
             rc_fixes = {
-                i for i in free - fixed_in_node
+                i for i in free - {fv[0] for fv in fixings}
                 if lp_rc[i] > gap + EPS
             }
 
-            # Branch variable selection (numpy-accelerated).
             branch_i = self._select_branch_var(
                 lp_sol, fixings, free, active_covers, costs, rc_fixes
             )
 
             if branch_i == -1:
-                # All free variables integral -> valid IP solution.
+                # LP solution is integral → valid IP solution
                 obj = float(np.dot(costs, lp_sol))
                 if obj < best_obj - EPS:
                     best_obj = obj
                     best_sol = lp_sol[:]
                 continue
 
-            # Precompute fixed_to_zero for quick infeasibility screening.
             fixed_to_zero = {i for i, v in fixings if v == 0} | rc_fixes
 
-            # Branch fix_val=1 first: rounding up is usually feasible for
-            # set-cover, so this branch tends to find incumbents faster.
             for fix_val in (1, 0):
                 if fix_val == 0:
-                    # Quick infeasibility check before building child LP.
                     fixed_to_zero.add(branch_i)
                     if self._quick_infeasible(active_pairs, fixed_to_zero):
                         fixed_to_zero.discard(branch_i)
                         continue
                     fixed_to_zero.discard(branch_i)
 
+                # Incorporate reduced-cost fixes as explicit 0-fixings so the LP
+                # model respects them at the child node.
                 new_fixings = (
                     fixings
                     + [(i, 0) for i in rc_fixes]
                     + [(branch_i, fix_val)]
                 )
-                child_obj, child_sol, child_rc = solve_node(new_fixings)
+                child_obj, child_sol, child_rc = apply_and_solve(new_fixings)
 
                 if child_sol is not None and child_obj < best_obj - EPS:
                     counter += 1
@@ -304,7 +300,8 @@ class IPInstance:
     def _preprocess(self, disc_pairs, test_covers, num_pairs):
         """
         Iteratively force tests that are the sole distinguisher of some pair.
-        Returns forced (set) and covered (set of already-satisfied pair indices).
+        Returns forced (set of test indices fixed to 1) and covered (set of
+        pair indices already satisfied).
         """
         forced  = set()
         covered = set()
@@ -334,18 +331,27 @@ class IPInstance:
 
     def _domination_pruning(self, test_covers, costs, n, forced):
         """
-        If test i covers a superset of what test j covers at <= cost,
-        j is permanently fixed to 0.  Forced tests are never eliminated.
+        If test i covers a superset of the pairs covered by test j and
+        cost[i] <= cost[j], then j is dominated and can never appear in an
+        optimal solution.  Dominated tests are permanently fixed to 0.
+
+        Forced tests are excluded from elimination since they must be 1.
         """
-        eliminated = set()
-        covers_set = [frozenset(test_covers[i]) for i in range(n)]
+        eliminated  = set()
+        covers_set  = [frozenset(test_covers[i]) for i in range(n)]
 
         for i in range(n):
             if i in eliminated or i in forced or not covers_set[i]:
                 continue
             for j in range(n):
-                if i == j or j in eliminated or j in forced or not covers_set[j]:
+                if (
+                    i == j
+                    or j in eliminated
+                    or j in forced
+                    or not covers_set[j]
+                ):
                     continue
+                # j is dominated by i: i covers everything j does at lower/equal cost
                 if costs[i] <= costs[j] and covers_set[j].issubset(covers_set[i]):
                     eliminated.add(j)
 
@@ -356,19 +362,37 @@ class IPInstance:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _greedy_upper_bound(self, costs, disc_pairs, test_covers, n, num_restarts=15):
+        """
+        Set-cover greedy with randomised cost perturbation on each restart.
+        The best feasible solution across all restarts is returned.
+
+        Using a noisy cost function on each restart diversifies which tests get
+        selected first, escaping local optima of the deterministic greedy and
+        yielding a tighter initial upper bound for BnB pruning.
+        """
         best_sol = None
         best_obj = math.inf
-        rng      = np.random.default_rng(42)
+
+        rng = np.random.default_rng(42)
 
         for r in range(num_restarts):
-            perturbed = costs if r == 0 else costs * rng.uniform(0.8, 1.2, size=n)
-            sol, obj  = self._greedy_single(perturbed, costs, disc_pairs, test_covers, n)
+            if r == 0:
+                perturbed = costs                          # first run: exact costs
+            else:
+                noise     = rng.uniform(0.8, 1.2, size=n) # ±20 % random perturbation
+                perturbed = costs * noise
+
+            sol, obj = self._greedy_single(perturbed, costs, disc_pairs, test_covers, n)
             if sol is not None and obj < best_obj:
                 best_sol, best_obj = sol, obj
 
         return best_sol, best_obj
 
     def _greedy_single(self, perturbed_costs, true_costs, disc_pairs, test_covers, n):
+        """
+        One greedy run.  Selection order uses perturbed_costs (for diversity)
+        but the returned objective is computed with true_costs.
+        """
         num_pairs   = len(disc_pairs)
         covered     = np.zeros(num_pairs, dtype=bool)
         selected    = np.zeros(n,         dtype=float)
@@ -376,11 +400,11 @@ class IPInstance:
         uncov_count = np.array([len(test_covers[i]) for i in range(n)], dtype=float)
 
         while not covered.all():
-            mask  = (selected < 0.5) & (uncov_count > 0)
+            mask   = (selected < 0.5) & (uncov_count > 0)
             if not mask.any():
                 break
-            scores = np.where(mask, uncov_count / perturbed_costs, -np.inf)
-            best_i = int(np.argmax(scores))
+            scores  = np.where(mask, uncov_count / perturbed_costs, -np.inf)
+            best_i  = int(np.argmax(scores))
             if scores[best_i] == -np.inf:
                 break
 
@@ -403,34 +427,41 @@ class IPInstance:
 
     def _select_branch_var(self, lp_sol, fixings, free, active_covers, costs, rc_fixes):
         """
-        Numpy-accelerated cost-weighted coverage branching.
-        Scores each fractional free variable as (frac * pairs_covered / cost).
-        Returns -1 if no fractional variable exists.
+        Cost-weighted coverage branching: among free, non-fixed, non-rc-fixed
+        fractional variables, prefer the one with the highest ratio of
+        (active pairs covered × fractionality) / cost.
+
+        This biases branching toward cheap tests that resolve many unsatisfied
+        constraints — far more informative than pure most-fractional selection
+        for set-cover IPs.
+
+        Returns -1 if all candidates are already integral.
         """
-        EPS        = 1e-6
-        fixed      = {i for i, _ in fixings} | rc_fixes
-        candidates = list(free - fixed)
+        EPS       = 1e-6
+        fixed     = {i for i, _ in fixings} | rc_fixes
+        candidates = free - fixed
 
-        if not candidates:
-            return -1
+        best_i     = -1
+        best_score = -1.0
 
-        sol_arr  = np.array([lp_sol[i]          for i in candidates])
-        fracs    = np.minimum(sol_arr, 1.0 - sol_arr)
+        for i in candidates:
+            v    = lp_sol[i]
+            frac = min(v, 1.0 - v)
+            if frac <= EPS:
+                continue
+            # Pairs covered by this test weighted by fractionality and inverse cost
+            coverage = len(active_covers[i])
+            score    = frac * coverage / max(costs[i], EPS)
+            if score > best_score:
+                best_score = score
+                best_i     = i
 
-        if fracs.max() <= EPS:
-            return -1
-
-        coverage = np.array([len(active_covers[i]) for i in candidates], dtype=float)
-        cost_arr = np.array([costs[i]               for i in candidates], dtype=float)
-        scores   = np.where(fracs > EPS,
-                            fracs * coverage / np.maximum(cost_arr, EPS),
-                            -np.inf)
-        return candidates[int(np.argmax(scores))]
+        return best_i
 
     def _quick_infeasible(self, active_pairs, fixed_to_zero):
         """
-        Returns True if any active pair has ALL distinguishing tests in
-        fixed_to_zero — LP would be trivially infeasible.
+        Returns True if any active disease pair has ALL distinguishing tests
+        in fixed_to_zero — making the LP trivially infeasible.
         """
         for disc in active_pairs:
             if all(i in fixed_to_zero for i in disc):
@@ -464,4 +495,3 @@ class IPInstance:
             for i in range(self.numTests)
         )
         return out
-  
